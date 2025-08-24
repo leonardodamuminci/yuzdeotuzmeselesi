@@ -1,26 +1,23 @@
-name: RSI Wick Touch Scan (with fallback)
+name: RSI Wick Touch Scan (binance-only)
 
 on:
   schedule:
-    - cron: '0 */2 * * *'   # Her 2 saatte bir (UTC)
-  workflow_dispatch: {}      # Elle çalıştır
+    - cron: '0 */2 * * *'     # Her 2 saatte bir (UTC)
+  workflow_dispatch: {}        # Elle çalıştırma düğmesi
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Run inline Python (Binance first, Yahoo fallback)
+      - name: Run inline Python (Binance only)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # İstersen repo Variables kısmına MAX_SYMBOLS ekleyebilirsin (örn. 300); yoksa varsayılan 400.
+          MAX_SYMBOLS: ${{ vars.MAX_SYMBOLS }}
         run: |
           python - <<'PY'
-          import os, json, math, urllib.request, urllib.error
+          import os, json, math, time, urllib.request, urllib.error
           from datetime import datetime, timezone, timedelta
 
           BOT  = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -29,6 +26,18 @@ jobs:
           assert CHAT.isdigit(), "TELEGRAM_CHAT_ID sadece rakam olmalı"
           if any(c in BOT for c in "\r\n\t"):
               raise ValueError("TELEGRAM_BOT_TOKEN tek satır olmalı.")
+
+          MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS") or 400)
+          RSI_LEN = 14
+          SMA_LEN = 14
+          BINANCE_BASES = [
+              "https://api.binance.com",
+              "https://api1.binance.com",
+              "https://api2.binance.com",
+              "https://api3.binance.com",
+              # Binance resmi data aynası (resmi arşiv servisi)
+              "https://data-api.binance.vision"
+          ]
 
           def http_get_json(url, timeout=20, headers=None):
               hdrs = {"User-Agent":"Mozilla/5.0"}
@@ -47,72 +56,33 @@ jobs:
               url = f"https://api.telegram.org/bot{BOT}/sendMessage"
               parts = [text[i:i+3900] for i in range(0, len(text), 3900)] or [text]
               for p in parts:
+                  http_post_json(url, {"chat_id": CHAT, "text": p})
+
+          # -------- Binance veri yardımcıları --------
+          def fetch_exchange_info():
+              last_err = None
+              for base in BINANCE_BASES:
                   try:
-                      http_post_json(url, {"chat_id": CHAT, "text": p})
-                  except urllib.error.HTTPError as e:
-                      print("Telegram HTTPError:", e.code, e.read().decode())
-                      raise
+                      return http_get_json(f"{base}/api/v3/exchangeInfo"), base
                   except Exception as e:
-                      print("Telegram error:", e); raise
+                      last_err = e
+                      continue
+              raise last_err
 
-          # --- Veri kaynakları ---
-          BINANCE_BASES = [
-              "https://api.binance.com",
-              "https://api1.binance.com",
-              "https://api2.binance.com",
-              "https://api3.binance.com",
-          ]
-          YAHOO_SYMBOL = {
-              "BTCUSDT":"BTC-USD","ETHUSDT":"ETH-USD","BNBUSDT":"BNB-USD",
-              "XRPUSDT":"XRP-USD","SOLUSDT":"SOL-USD"
-          }
-
-          def fetch_high_low_binance(sym, limit=200):
+          def fetch_klines(sym, limit=200):
               last_err = None
               for base in BINANCE_BASES:
                   url = f"{base}/api/v3/klines?symbol={sym}&interval=1d&limit={limit}"
                   try:
                       kl = http_get_json(url)
-                      highs = [float(k[2]) for k in kl]
-                      lows  = [float(k[3]) for k in kl]
-                      if len(highs) >= 40:   # RSI+SMA için yeterli
-                          return highs, lows, "binance"
-                  except urllib.error.HTTPError as e:
-                      last_err = e
-                      continue
+                      if kl and len(kl) >= 40:
+                          return kl, base
                   except Exception as e:
                       last_err = e
                       continue
-              if last_err: raise last_err
-              raise RuntimeError("Binance erişilemedi")
+              raise last_err or RuntimeError("Klines alınamadı")
 
-          def fetch_high_low_yahoo(sym, limit=200):
-              ysym = YAHOO_SYMBOL.get(sym)
-              if not ysym: 
-                  raise RuntimeError(f"Yahoo eşlemesi yok: {sym}")
-              # 1y al, en sondan limit kadarını kullan
-              url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}?interval=1d&range=1y"
-              data = http_get_json(url)
-              res = data.get("chart",{}).get("result",[])
-              if not res: raise RuntimeError(f"Yahoo boş: {ysym}")
-              quote = res[0]["indicators"]["quote"][0]
-              highs = [float(x) for x in quote["high"] if x is not None]
-              lows  = [float(x) for x in quote["low"]  if x is not None]
-              # boyları eşitle
-              n = min(len(highs), len(lows))
-              highs, lows = highs[-n:], lows[-n:]
-              if len(highs) >= 40:
-                  return highs[-limit:], lows[-limit:], "yahoo"
-              raise RuntimeError(f"Yahoo veri yetersiz: {ysym}")
-
-          def get_highs_lows(sym):
-              try:
-                  return fetch_high_low_binance(sym)
-              except Exception as e:
-                  print(f"[{sym}] Binance olmazsa Yahoo'ya düşüyorum: {e}")
-                  return fetch_high_low_yahoo(sym)
-
-          # --- Göstergeler ---
+          # -------- Göstergeler --------
           def rsi_wilder(series, period):
               x = list(map(float, series))
               n = len(x); r = [math.nan]*n
@@ -143,20 +113,39 @@ jobs:
               tr = timezone(timedelta(hours=3))
               return datetime.now(tr).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-          def scan():
-              symbols = ["BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT"]
-              header = f"⏱️ {now_tr()}\n📡 1D wick-touch taraması (2 saatte 1)\n⏳ RSI=14, SMA=14 | Eşikler: 0.7 / 1.3\n"
-              results = []
-              used_source = None
+          # -------- TARAMA --------
+          def get_usdt_spot_symbols(max_n):
+              info, used_base = fetch_exchange_info()
+              syms = []
+              for s in info.get("symbols", []):
+                  if (s.get("status")=="TRADING"
+                      and s.get("isSpotTradingAllowed", True)
+                      and s.get("quoteAsset")=="USDT"):
+                      sym = s["symbol"]
+                      # kaldıraç/leveraged tokenları çıkar
+                      if any(x in sym for x in ["UP","DOWN","BULL","BEAR"]):
+                          continue
+                      syms.append(sym)
+              syms = sorted(set(syms))
+              return syms[:max_n], used_base
 
-              for sym in symbols:
+          def scan():
+              symbols, base_info = get_usdt_spot_symbols(MAX_SYMBOLS)
+              header = f"⏱️ {now_tr()}\n📡 Binance 1D wick-touch (2 saatte 1)\n⏳ RSI={RSI_LEN}, SMA={SMA_LEN} | Eşikler: 0.7 / 1.3\nToplam sembol: {len(symbols)}\n"
+              results = []
+              used_sources = set([base_info])
+
+              for idx, sym in enumerate(symbols, 1):
                   try:
-                      highs, lows, source = get_highs_lows(sym)
-                      used_source = used_source or source  # ilk bulduğunu yazacağız
-                      rsi_low  = rsi_wilder(lows, 14)
-                      rsi_high = rsi_wilder(highs,14)
-                      sma_low  = sma(rsi_low, 14)
-                      sma_high = sma(rsi_high,14)
+                      kl, base_used = fetch_klines(sym, limit=200)
+                      used_sources.add(base_used)
+                      highs = [float(k[2]) for k in kl]
+                      lows  = [float(k[3]) for k in kl]
+
+                      rsi_low  = rsi_wilder(lows,  RSI_LEN)
+                      rsi_high = rsi_wilder(highs, RSI_LEN)
+                      sma_low  = sma(rsi_low,  SMA_LEN)
+                      sma_high = sma(rsi_high, SMA_LEN)
 
                       rl_c, rl_p = rsi_low[-1],  rsi_low[-2]
                       sl_c, sl_p = sma_low[-1],  sma_low[-2]
@@ -179,11 +168,14 @@ jobs:
                           tp = high_c/1.3
                           results.append(f"🔴 SELL {sym} @ {high_c:.8g} | TP≈{tp:.8g} | RSI(high)={rh_c:.2f} SMA(high)={sh_c:.2f}")
 
+                      # nazik rate-limit
+                      time.sleep(0.12)
+
                   except Exception as e:
                       results.append(f"ERR {sym}: {e}")
 
-              src_line = f"\nℹ️ Veri kaynağı: {used_source or 'binance→yahoo karışık'}"
-              body = header + ("\n".join(results) if results else "• İşlem yok") + src_line
+              src_note = " / ".join(sorted({s.split('//')[1].split('/')[0] for s in used_sources if s}))
+              body = header + ("\n".join(results) if results else "• İşlem yok") + f"\nℹ️ Kaynak(lar): {src_note or 'binance'}"
               send_tg(body)
 
           if __name__ == "__main__":
