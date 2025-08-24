@@ -1,32 +1,34 @@
-name: RSI Wick Touch Scan (one-file)
+name: RSI Wick Touch Scan (one-step)
 
 on:
   schedule:
-    - cron: "0 */2 * * *"    # Her 2 saatte bir (UTC)
-  workflow_dispatch: {}       # Elle çalıştırma düğmesi
+    - cron: '0 */2 * * *'   # Her 2 saatte bir (UTC)
+  workflow_dispatch: {}      # Elle çalıştır
 
 jobs:
-  run-scan:
+  scan:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Write inline bot (no deps)
-        shell: bash
+      - name: Run inline Python (send to Telegram)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          cat > bot_inline.py << 'PY'
+          python - <<'PY'
           import os, json, math, urllib.request, urllib.error
           from datetime import datetime, timezone, timedelta
-         BOT = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-CHAT = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
-assert BOT and CHAT, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID eksik!"
-assert CHAT.isdigit(), "TELEGRAM_CHAT_ID sadece rakamlardan oluşmalı"
-# Güvenlik/teşhis: token’da kontrol karakteri varsa uyar
-if any(c in BOT for c in "\r\n\t"):
-    raise ValueError("TELEGRAM_BOT_TOKEN içinde satır sonu/boşluk var: Secrets'a TEK SATIR olarak kaydet.")
+
+          BOT  = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+          CHAT = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+          assert BOT and CHAT, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID eksik!"
+          assert CHAT.isdigit(), "TELEGRAM_CHAT_ID sadece rakamlardan oluşmalı"
+          if any(c in BOT for c in "\r\n\t"):
+              raise ValueError("TELEGRAM_BOT_TOKEN içinde satır sonu/boşluk var. Secrets'a tek satır girin.")
 
           def http_get_json(url, timeout=20):
               req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
@@ -45,13 +47,16 @@ if any(c in BOT for c in "\r\n\t"):
               for p in parts:
                   try:
                       http_post_json(url, {"chat_id": CHAT, "text": p})
+                  except urllib.error.HTTPError as e:
+                      print("Telegram HTTPError:", e.code, e.read().decode())
+                      raise
                   except Exception as e:
                       print("Telegram error:", e)
+                      raise
 
           def rsi_wilder(series, period):
               x = list(map(float, series))
-              n = len(x)
-              r = [math.nan]*n
+              n = len(x); r = [math.nan]*n
               if n <= period: return r
               delta = [x[i]-x[i-1] for i in range(1,n)]
               gains = [d if d>0 else 0.0 for d in delta]
@@ -78,7 +83,7 @@ if any(c in BOT for c in "\r\n\t"):
               return out
 
           def now_tr():
-              tr = timezone(timedelta(hours=3))  # Türkiye saati
+              tr = timezone(timedelta(hours=3))
               return datetime.now(tr).strftime("%Y-%m-%d %H:%M:%S %Z")
 
           def scan():
@@ -130,9 +135,3 @@ if any(c in BOT for c in "\r\n\t"):
           if __name__ == "__main__":
               scan()
           PY
-
-      - name: Run bot
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bot_inline.py
