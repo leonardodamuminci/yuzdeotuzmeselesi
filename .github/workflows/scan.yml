@@ -2,8 +2,8 @@ name: RSI Wick Touch Scan (binance-only)
 
 on:
   schedule:
-    - cron: '0 */2 * * *'     # Her 2 saatte bir (UTC)
-  workflow_dispatch: {}        # Elle çalıştırma düğmesi
+    - cron: '*/30 * * * *'   # Her 30 dakikada bir (UTC)
+  workflow_dispatch: {}       # (İstersen elle de tetikleyebil)
 
 jobs:
   scan:
